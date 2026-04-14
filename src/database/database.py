@@ -1,18 +1,44 @@
-import os
+"""
+database.py
+===========
+Core database layer for the Munder Difflin sales system.
+
+Responsibilities:
+- Defines the full product catalogue (paper_supplies)
+- Creates and seeds the SQLite database on first run (init_database)
+- Provides parameterised query helpers for inventory, transactions, cash, and quote history
+- Exposes a module-level `db_engine` used by all tool modules
+
+Tables managed here:
+    transactions   — every stock order and sale event
+    inventory      — master item catalogue with unit prices and stock metadata
+    quote_requests — raw inbound customer request text
+    quotes         — generated quotes linked to requests
+"""
+
 import ast
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 from typing import Dict, List, Union
-from sqlalchemy import create_engine, Engine
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.sql import text
 
+# Ensure required directories exist before any file I/O
 os.makedirs("db", exist_ok=True)
 os.makedirs("data/input", exist_ok=True)
 os.makedirs("data/output", exist_ok=True)
 
+# Module-level engine shared across all tool modules
 db_engine = create_engine("sqlite:///db/munder_difflin.db")
 
+# ── Product catalogue ─────────────────────────────────────────────────────────
+# Master list of every paper product Munder Difflin sells.
+# Each entry carries the item name, product category, and unit price in USD.
+# Categories: "paper" (per sheet), "product" (per unit),
+#             "large_format" (per unit), "specialty" (per unit)
 paper_supplies = [
     # Paper Types (priced per sheet unless specified)
     {"item_name": "A4 paper",                                   "category": "paper",        "unit_price": 0.05},
@@ -71,7 +97,18 @@ paper_supplies = [
 
 
 def generate_sample_inventory(paper_supplies: list, coverage: float = 0.4, seed: int = 137) -> pd.DataFrame:
-    """Generate inventory for a specified percentage of items."""
+    """Randomly selects a subset of products from the catalogue and assigns them
+    realistic starting stock levels and minimum stock thresholds.
+
+    Args:
+        paper_supplies: Full product catalogue list of dicts.
+        coverage: Fraction of catalogue items to include (0.0–1.0). Default 0.4.
+        seed: NumPy random seed for reproducibility. Default 137.
+
+    Returns:
+        DataFrame with columns: item_name, category, unit_price,
+        current_stock, min_stock_level.
+    """
     np.random.seed(seed)
     num_items = int(len(paper_supplies) * coverage)
     selected_indices = np.random.choice(range(len(paper_supplies)), size=num_items, replace=False)
@@ -90,8 +127,32 @@ def generate_sample_inventory(paper_supplies: list, coverage: float = 0.4, seed:
 
 
 def init_database(engine: Engine, seed: int = 137) -> Engine:
-    """Set up the Munder Difflin database."""
+    """Creates and seeds all four database tables from the CSV input files.
+
+    Drops and recreates every table on each call, so this is intended to be
+    called once at the start of a batch run to reset state.
+
+    Seeding steps:
+        1. Creates an empty `transactions` schema table.
+        2. Loads quote_requests.csv → `quote_requests` table.
+        3. Loads quotes.csv, unpacks request_metadata JSON → `quotes` table.
+        4. Generates full inventory from paper_supplies catalogue.
+        5. Inserts an opening cash balance transaction of $50,000.
+        6. Inserts one stock_orders transaction per inventory item.
+        7. Writes the inventory master table.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the target SQLite database.
+        seed: Random seed forwarded to generate_sample_inventory. Default 137.
+
+    Returns:
+        The same engine, for method chaining.
+
+    Raises:
+        Exception: Re-raises any database or file I/O error after printing it.
+    """
     try:
+        # Create empty transactions table to enforce column schema
         transactions_schema = pd.DataFrame({
             "id": [], "item_name": [], "transaction_type": [],
             "units": [], "price": [], "transaction_date": [],
@@ -100,10 +161,12 @@ def init_database(engine: Engine, seed: int = 137) -> Engine:
 
         initial_date = datetime(2025, 1, 1).isoformat()
 
+        # Load and index historical quote requests
         quote_requests_df = pd.read_csv("data/input/quote_requests.csv")
         quote_requests_df["id"] = range(1, len(quote_requests_df) + 1)
         quote_requests_df.to_sql("quote_requests", engine, if_exists="replace", index=False)
 
+        # Load quotes and unpack the nested request_metadata dict column
         quotes_df = pd.read_csv("data/input/quotes.csv")
         quotes_df["request_id"] = range(1, len(quotes_df) + 1)
         quotes_df["order_date"] = initial_date
@@ -122,8 +185,10 @@ def init_database(engine: Engine, seed: int = 137) -> Engine:
         ]]
         quotes_df.to_sql("quotes", engine, if_exists="replace", index=False)
 
+        # Build inventory and write opening transactions
         inventory_df = generate_sample_inventory(paper_supplies, coverage=1.0, seed=seed)
         initial_transactions = [{
+            # Opening cash injection — no item, treated as a sales-type credit
             "item_name": None, "transaction_type": "sales",
             "units": None, "price": 50000.0, "transaction_date": initial_date,
         }]
@@ -154,7 +219,24 @@ def create_transaction(
     price: float,
     date: Union[str, datetime],
 ) -> int:
-    """Records a transaction and returns its row ID."""
+    """Appends a new row to the transactions table and returns its auto-increment ID.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        item_name: Name of the inventory item involved in the transaction.
+        transaction_type: Either "stock_orders" (incoming stock) or "sales" (outgoing order).
+        quantity: Number of units in this transaction.
+        price: Total monetary value of this transaction in USD.
+        date: Transaction date as ISO string or datetime object.
+
+    Returns:
+        Integer row ID assigned by SQLite to the inserted row.
+
+    Raises:
+        ValueError: If transaction_type is not "stock_orders" or "sales".
+        RuntimeError: If the last_insert_rowid() query returns an empty result.
+        Exception: Re-raises any other database error after printing it.
+    """
     try:
         date_str = date.isoformat() if isinstance(date, datetime) else date
         if transaction_type not in {"stock_orders", "sales"}:
@@ -168,6 +250,8 @@ def create_transaction(
             "transaction_date": date_str,
         }])
         transaction.to_sql("transactions", engine, if_exists="append", index=False)
+
+        # Retrieve the auto-assigned row ID from SQLite
         result = pd.read_sql("SELECT last_insert_rowid() as id", engine)
         if result.empty:
             raise RuntimeError("Failed to retrieve transaction ID after insert")
@@ -178,7 +262,19 @@ def create_transaction(
 
 
 def get_all_inventory(engine: Engine, as_of_date: str) -> Dict[str, int]:
-    """Retrieves all inventory stock levels as of a specific date."""
+    """Returns a dict of {item_name: stock_level} for all items with positive stock
+    as of the given date.
+
+    Stock is computed by summing stock_orders and subtracting sales up to as_of_date,
+    so historical snapshots can be generated by passing any past date.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        as_of_date: Upper-bound date string in ISO format (YYYY-MM-DD or full ISO).
+
+    Returns:
+        Dict mapping item_name → net stock units (only items with stock > 0).
+    """
     query = """
         SELECT item_name,
                SUM(CASE
@@ -195,7 +291,19 @@ def get_all_inventory(engine: Engine, as_of_date: str) -> Dict[str, int]:
 
 
 def get_stock_level(engine: Engine, item_name: str, as_of_date: Union[str, datetime]) -> pd.DataFrame:
-    """Retrieves the current stock level for a specific item."""
+    """Returns a single-row DataFrame with the net stock level for one item as of a date.
+
+    Uses COALESCE so an item with no transactions returns 0 rather than NULL.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        item_name: Exact inventory item name to query.
+        as_of_date: Upper-bound date as ISO string or datetime object.
+
+    Returns:
+        DataFrame with columns [item_name, current_stock]. Always has exactly
+        one row (current_stock may be 0 if the item has never been transacted).
+    """
     if isinstance(as_of_date, datetime):
         as_of_date = as_of_date.isoformat()
     stock_query = """
@@ -212,7 +320,15 @@ def get_stock_level(engine: Engine, item_name: str, as_of_date: Union[str, datet
 
 
 def get_cash_balance(engine: Engine, as_of_date: Union[str, datetime]) -> float:
-    """Calculates net cash balance (sales revenue minus stock purchase costs)."""
+    """Calculates the net cash position as total sales revenue minus stock purchase costs.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        as_of_date: Upper-bound date as ISO string or datetime object.
+
+    Returns:
+        Float representing net cash in USD. Returns 0.0 on error or empty table.
+    """
     try:
         if isinstance(as_of_date, datetime):
             as_of_date = as_of_date.isoformat()
@@ -231,7 +347,24 @@ def get_cash_balance(engine: Engine, as_of_date: Union[str, datetime]) -> float:
 
 
 def generate_financial_report(engine: Engine, as_of_date: Union[str, datetime]) -> Dict:
-    """Generates a full financial snapshot including cash balance and inventory value."""
+    """Generates a full financial snapshot at the given point in time.
+
+    Combines cash balance, per-item inventory valuation, and a top-5 best-sellers list
+    into a single dict suitable for writing to the OLAP output CSV.
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        as_of_date: Snapshot date as ISO string or datetime object.
+
+    Returns:
+        Dict with keys:
+            as_of_date       — ISO date string of the snapshot
+            cash_balance     — net cash in USD
+            inventory_value  — total value of remaining stock at unit prices
+            total_assets     — cash_balance + inventory_value
+            inventory_summary — list of {item_name, stock, unit_price, value} dicts
+            top_selling_products — list of top 5 items by revenue
+    """
     if isinstance(as_of_date, datetime):
         as_of_date = as_of_date.isoformat()
     cash = get_cash_balance(engine, as_of_date)
@@ -267,7 +400,21 @@ def generate_financial_report(engine: Engine, as_of_date: Union[str, datetime]) 
 
 
 def search_quote_history(engine: Engine, search_terms: List[str], limit: int = 5) -> List[Dict]:
-    """Searches past quotes and requests matching the given keywords."""
+    """Searches past quotes and customer requests that contain all given keywords.
+
+    Builds a parameterised SQL query joining quote_requests and quotes, filtering
+    rows where every search term appears in either the request text or the quote
+    explanation (case-insensitive AND match).
+
+    Args:
+        engine: SQLAlchemy engine pointing at the database.
+        search_terms: List of keyword strings. All terms must match (AND logic).
+        limit: Maximum number of results to return. Default 5.
+
+    Returns:
+        List of dicts with keys: original_request, total_amount, quote_explanation,
+        job_type, order_size, event_type, order_date. Ordered by most recent first.
+    """
     conditions = []
     params = {}
     for i, term in enumerate(search_terms):

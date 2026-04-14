@@ -7,6 +7,8 @@
 # Python bytecode caches
 __pycache__/
 
+reference/
+
 # Output simulation databases generated during runs
 oltp_database.csv
 olap_database.csv
