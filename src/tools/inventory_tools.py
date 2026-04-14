@@ -27,7 +27,8 @@ def find_similar_inventory_item_tool(search_term: str) -> str:
             elif score == highest_score and best_match and len(item_name) < len(best_match):
                 best_match = item_name
         return best_match if highest_score > 0 else ""
-    except Exception:
+    except Exception as e:
+        print(f"Error searching inventory: {e}")
         return ""
 
 

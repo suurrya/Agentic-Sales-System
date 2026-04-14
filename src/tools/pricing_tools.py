@@ -18,7 +18,8 @@ def get_item_unit_price(item_name: str) -> float:
             params={"item": item_name},
         )
         return float(price_df.iloc[0]["unit_price"]) if not price_df.empty else 0.0
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching unit price for '{item_name}': {e}")
         return 0.0
 
 

@@ -169,6 +169,8 @@ def create_transaction(
         }])
         transaction.to_sql("transactions", engine, if_exists="append", index=False)
         result = pd.read_sql("SELECT last_insert_rowid() as id", engine)
+        if result.empty:
+            raise RuntimeError("Failed to retrieve transaction ID after insert")
         return int(result.iloc[0]["id"])
     except Exception as e:
         print(f"Error creating transaction: {e}")
@@ -238,7 +240,7 @@ def generate_financial_report(engine: Engine, as_of_date: Union[str, datetime]) 
     inventory_summary = []
     for _, item in inventory_df.iterrows():
         stock_info = get_stock_level(engine, item["item_name"], as_of_date)
-        stock = stock_info["current_stock"].iloc[0]
+        stock = int(stock_info["current_stock"].iloc[0]) if not stock_info.empty else 0
         item_value = stock * item["unit_price"]
         inventory_value += item_value
         inventory_summary.append({

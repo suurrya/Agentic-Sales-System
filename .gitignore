@@ -2,7 +2,7 @@
 .env
 
 # Python virtual environment containing dependencies
-venv/
+.venv/
 
 # Python bytecode caches
 __pycache__/

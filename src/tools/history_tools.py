@@ -10,4 +10,6 @@ def get_customer_history_tool(search_terms: List[str]) -> List[Dict]:
     Args:
         search_terms (List[str]): A list of keywords to search for in past quotes and requests.
     """
+    if not search_terms:
+        return []
     return search_quote_history(db_engine, search_terms, limit=3)
