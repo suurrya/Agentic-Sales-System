@@ -1,0 +1,13 @@
+# Local environment variables including API keys
+.env
+
+# Python virtual environment containing dependencies
+venv/
+
+# Python bytecode caches
+__pycache__/
+
+# Output simulation databases generated during runs
+oltp_database.csv
+olap_database.csv
+*.db

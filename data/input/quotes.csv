@@ -1,0 +1,6 @@
+request_id,total_amount,quote_explanation,request_metadata
+1,50.00,"Quote for 500 A4 paper ($25) and 50 presentation folders ($25).","{""job_type"": ""Office"", ""order_size"": ""small"", ""event_type"": ""internal""}"
+2,130.00,"Quote for 200 flyers ($30) and 500 glossy paper ($100).","{""job_type"": ""Marketing"", ""order_size"": ""medium"", ""event_type"": ""promo""}"
+3,18.00,"Quote for 100 paper cups ($8) and 100 paper plates ($10). Non-profit discount applied.","{""job_type"": ""non-profit"", ""order_size"": ""small"", ""event_type"": ""party""}"
+4,25.00,"Quote for 10 rolls of banner paper ($25).","{""job_type"": ""Marketing"", ""order_size"": ""small"", ""event_type"": ""promo""}"
+5,430.00,"Quote for 200 notepads ($400) and 1000 sticky notes ($30).","{""job_type"": ""Office"", ""order_size"": ""large"", ""event_type"": ""conference""}"
