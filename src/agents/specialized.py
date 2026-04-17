@@ -17,10 +17,32 @@ as a dict keyed by role name, which is then passed to create_orchestrator_tools(
 
 from smolagents import ToolCallingAgent
 
+from src.agents.prompts import CUSTOMER_RELATIONSHIP_PROMPT, INVENTORY_PROMPT, QUOTATION_PROMPT, SALES_PROMPT, REQUEST_PARSER_PROMPT
 from src.tools.fulfillment_tools import fulfill_order_tool, get_delivery_timeline_tool
 from src.tools.history_tools import get_customer_history_tool
 from src.tools.inventory_tools import check_inventory_tool, find_similar_inventory_item_tool
 from src.tools.pricing_tools import get_item_unit_price
+
+
+class RequestParserAgent(ToolCallingAgent):
+    """LLM fallback parser — only invoked when the regex parser returns nothing.
+
+    Has no tools beyond final_answer. Given a free-form customer request it
+    normalises spelling (coloured → colored), resolves informal descriptions,
+    and returns a JSON string: {"items": [{"item_name": "...", "quantity": N}]}.
+
+    Keeping it as a ToolCallingAgent (rather than a direct model call) means it
+    reuses ResilientOpenAIModel's retry logic and the existing json-repair patches.
+    """
+
+    def __init__(self, model):
+        super().__init__(
+            name="request_parser_agent",
+            tools=[],
+            model=model,
+            max_steps=2,
+            instructions=REQUEST_PARSER_PROMPT,
+        )
 
 
 class CustomerRelationshipAgent(ToolCallingAgent):
@@ -39,9 +61,10 @@ class CustomerRelationshipAgent(ToolCallingAgent):
         """
         super().__init__(
             name="customer_relationship_agent",
-            description="You are a customer relationship specialist. Find past history related to a customer's inquiry.",
+            description=CUSTOMER_RELATIONSHIP_PROMPT,
             tools=[get_customer_history_tool],
             model=model,
+            max_steps=4,
         )
 
 
@@ -62,13 +85,10 @@ class InventoryAgent(ToolCallingAgent):
         """
         super().__init__(
             name="inventory_agent",
-            description=(
-                "You are an inventory management specialist. Answer questions about product stock levels and delivery timelines. "
-                "You can also find similar items in inventory if the requested one is out of stock. "
-                "Extract ONLY the simple item name before calling tools."
-            ),
+            description=INVENTORY_PROMPT,
             tools=[check_inventory_tool, get_delivery_timeline_tool, find_similar_inventory_item_tool],
             model=model,
+            max_steps=6,
         )
 
 
@@ -88,13 +108,10 @@ class QuotationAgent(ToolCallingAgent):
         """
         super().__init__(
             name="quotation_agent",
-            description=(
-                "You are a pricing specialist. Generate a quote for a customer. "
-                "State if you are applying any discounts. Use get_item_unit_price tool to get the base prices. "
-                "If an item is not directly found, you can try to find a similar one."
-            ),
             tools=[get_item_unit_price, find_similar_inventory_item_tool],
             model=model,
+            max_steps=8,
+            instructions=QUOTATION_PROMPT,
         )
 
 
@@ -114,9 +131,10 @@ class SalesAgent(ToolCallingAgent):
         """
         super().__init__(
             name="sales_agent",
-            description="You are a sales finalization specialist. Process confirmed sales by creating transaction records.",
             tools=[fulfill_order_tool],
             model=model,
+            max_steps=6,
+            instructions=SALES_PROMPT,
         )
 
 
@@ -131,6 +149,7 @@ def create_specialized_agents(model) -> dict:
         Each value is the corresponding instantiated agent.
     """
     return {
+        "parser": RequestParserAgent(model),
         "customer_relationship": CustomerRelationshipAgent(model),
         "inventory": InventoryAgent(model),
         "quotation": QuotationAgent(model),

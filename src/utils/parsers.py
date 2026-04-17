@@ -26,6 +26,7 @@ import json
 import re
 from typing import List, Optional, Tuple
 
+from json_repair import repair_json
 from pydantic import BaseModel, field_validator
 
 
@@ -113,13 +114,44 @@ class TransactionResult(BaseModel):
     transaction_id: str
 
 
-# ── JSON extraction helper ────────────────────────────────────────────────────
+# ── JSON extraction helpers ───────────────────────────────────────────────────
+
+def _extract_nested_json(text: str) -> Optional[dict]:
+    """Like _extract_json but handles nested structures (lists inside objects).
+
+    Walks the string to find balanced braces rather than using a regex that
+    forbids inner braces.  Used by llm_parse_request where the agent returns
+    {"items": [{"item_name": ..., "quantity": N}, ...]}.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                blob = text[start : i + 1]
+                try:
+                    return json.loads(blob)
+                except json.JSONDecodeError:
+                    try:
+                        repaired = repair_json(blob, ensure_ascii=False, return_objects=False)
+                        return json.loads(repaired)
+                    except Exception:
+                        return None
+    return None
+
 
 def _extract_json(text: str) -> Optional[dict]:
     """Searches text for the first JSON object and parses it.
 
-    Uses a non-nested brace regex, so deeply nested JSON objects may not be
-    captured correctly. Sufficient for the flat schemas used in this project.
+    Three-layer approach:
+    1. json.loads on the raw extracted blob (zero overhead for valid JSON).
+    2. json-repair on the blob (fixes single quotes, trailing commas, etc.).
+    3. Returns None if both layers fail, letting the regex fallback take over.
 
     Args:
         text: Any string, typically an LLM agent response.
@@ -128,11 +160,23 @@ def _extract_json(text: str) -> Optional[dict]:
         Parsed dict if a valid JSON object was found, otherwise None.
     """
     match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+    if not match:
+        return None
+    blob = match.group()
+
+    # Layer 1: standard parse (fastest path)
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        pass
+
+    # Layer 2: repair then parse
+    try:
+        repaired = repair_json(blob, ensure_ascii=False, return_objects=False)
+        return json.loads(repaired)
+    except (json.JSONDecodeError, Exception):
+        pass
+
     return None
 
 
@@ -159,51 +203,122 @@ def parse_customer_request(request: str) -> List[Tuple[str, int]]:
         except Exception:
             pass
 
-    # Regex fallback — matches "500 sheets of A4 paper" style patterns
+    # Regex fallback — two patterns handle the two natural-language styles:
+    #
+    # Style A: "500 sheets of A4 paper"  (quantity + unit-word + item name)
+    #   The unit-word list identifies the boundary; item name follows.
+    #   When no item name follows the unit word (e.g. "300 envelopes"),
+    #   the unit word itself becomes the item name.
+    #
+    # Style B: "1000 flyers" / "2000 disposable cups" / "50 table covers"
+    #   (quantity + descriptive prefix? + known product-ending keyword)
+    #   The prefix is fully optional so single-word products like "napkins"
+    #   or "envelopes" are captured correctly.
+    #
+    # Shared terminator lookahead stops at: comma, "and", "for", "along with",
+    # sentence-ending punctuation, opening parenthesis, or end-of-string.
+    _STOP = r"(?=\s*,|\s+and\b|\s+for\b|\s+along with\b|\.|[?!]|$|\n|\s*\()"
+
     items_found = []
-    pattern = re.compile(
-        r"([\d,]+)\s+(sheets?|reams?|packets?|rolls?|flyers?|posters?|tickets?|napkins?|plates?|cups?|cards?|envelopes?|tags?|folders?|bags?|streamers?)\s*(?:of\s*)?(.+?)(?=\s*,|\s+and|\s+along with|\.|$|\n)",
+
+    # ── Style A ──────────────────────────────────────────────────────────────
+    _UNIT_WORDS = (
+        r"sheets?|reams?|packets?|rolls?|cards?|envelopes?|folders?"
+        r"|bags?|streamers?|covers?|notepads?|tags?"
+    )
+    pattern_a = re.compile(
+        r"(\d[\d,]*)\s+"
+        rf"({_UNIT_WORDS})\s*"
+        r"(?:of\s+)?(.*?)" + _STOP,
         re.IGNORECASE,
     )
-    for line in request.split("\n"):
-        line = line.strip().lstrip("- ").strip()
-        if not line:
+
+    # ── Style B ──────────────────────────────────────────────────────────────
+    # Known product-ending keywords.  The optional prefix `(?:...\s+)?` allows
+    # both "napkins" (no prefix) and "paper napkins" / "disposable cups" (with
+    # prefix) to be captured by the same rule.
+    _PRODUCT_ENDINGS = (
+        r"flyers?|posters?|tickets?|napkins?|plates?|cups?|folders?"
+        r"|notes?|bags?|covers?|cards?|envelopes?|papers?\b[^,]*?"
+    )
+    pattern_b = re.compile(
+        r"(\d[\d,]*)\s+"
+        r"((?:disposable\s+)?(?:large\s+|small\s+|sticky\s+)?"
+        rf"(?:[a-zA-Z][a-zA-Z0-9 \-]*?\s+)?(?:{_PRODUCT_ENDINGS}))"
+        + _STOP,
+        re.IGNORECASE,
+    )
+
+    full_text = " ".join(request.split("\n"))  # flatten to single line
+
+    # Unit-word stripper: removes leading "sheets of" / "rolls of" etc. from
+    # Pattern B results so they don't duplicate Style A captures.
+    _leading_unit = re.compile(
+        rf"^(?:{_UNIT_WORDS})\s+(?:of\s+)?", re.IGNORECASE
+    )
+
+    seen: set = set()
+
+    # ── Run Style A first ─────────────────────────────────────────────────────
+    for match in pattern_a.finditer(full_text):
+        try:
+            quantity_str, unit_word, item_name_raw = match.groups()
+            quantity = int(quantity_str.replace(",", ""))
+            item_name = item_name_raw.strip()
+            item_name = re.sub(r"\s*\([^)]*\)", "", item_name).strip()  # strip parentheticals
+            item_name = " ".join(item_name.split())
+            # "300 envelopes" → unit="envelopes", item="" → use unit word as name
+            if not item_name:
+                item_name = unit_word.strip()
+            if len(item_name) > 1 and (item_name, quantity) not in seen:
+                items_found.append((item_name, quantity))
+                seen.add((item_name, quantity))
+        except (ValueError, IndexError):
             continue
-        matches = pattern.findall(line)
-        for match in matches:
-            try:
-                quantity_str, unit, item_name_raw = match
-                quantity = int(quantity_str.replace(",", ""))
-                # For discrete product units (flyers, plates, etc.) append the unit word
-                if unit.lower().rstrip("s") in [
-                    "flyer", "poster", "ticket", "napkin", "plate", "cup",
-                    "card", "envelope", "tag", "folder", "bag", "streamer",
-                ]:
-                    item_name = f"{item_name_raw.strip()} {unit.strip()}"
-                else:
-                    item_name = item_name_raw.strip()
-                # Strip parenthetical annotations and collapse whitespace
-                item_name = re.sub(r"\s*\([^)]*\)", "", item_name).strip()
-                item_name = " ".join(item_name.split())
-                if item_name and len(item_name) > 1:
-                    items_found.append((item_name, quantity))
-            except (ValueError, IndexError):
-                continue
+
+    # ── Run Style B, deduplicating against Style A ───────────────────────────
+    for match in pattern_b.finditer(full_text):
+        try:
+            quantity_str, item_name_raw = match.groups()
+            quantity = int(quantity_str.replace(",", ""))
+            item_name = item_name_raw.strip()
+            item_name = re.sub(r"\s*\([^)]*\)", "", item_name).strip()
+            item_name = " ".join(item_name.split())
+            # Strip leading unit words so "sheets of A4 paper" normalises to
+            # "A4 paper" and is recognised as already captured by Style A.
+            normalised = _leading_unit.sub("", item_name).strip()
+            if len(item_name) > 1 and (normalised, quantity) not in seen and (item_name, quantity) not in seen:
+                items_found.append((item_name, quantity))
+                seen.add((item_name, quantity))
+                seen.add((normalised, quantity))
+        except (ValueError, IndexError):
+            continue
+
     return items_found
 
 
-def parse_price_from_quote(quote_response: str) -> float:
+def parse_price_from_quote(quote_response) -> float:
     """Extracts the total price from a QuotationAgent response.
 
     Tries JSON QuoteResult first; falls back to a regex matching
     "Total: $X,XXX.XX" patterns.
 
     Args:
-        quote_response: Raw string response from the quotation agent.
+        quote_response: Raw response from the quotation agent — may be a str,
+                        int, or float when the LLM returns a bare number as
+                        its final_answer (e.g. {'answer': 20}).
 
     Returns:
         Float total price in USD, or 0.0 if no price could be extracted.
     """
+    # Agent returned a bare numeric answer (int or float) — use it directly.
+    if isinstance(quote_response, (int, float)):
+        return float(quote_response)
+
+    # Coerce anything else (None, list, …) to a safe empty string.
+    if not isinstance(quote_response, str):
+        quote_response = ""
+
     data = _extract_json(quote_response)
     if data:
         try:
@@ -211,15 +326,49 @@ def parse_price_from_quote(quote_response: str) -> float:
         except Exception:
             pass
 
-    # Regex fallback — matches "Total: $1,234.56" style lines
-    total_match = re.search(
-        r"Total:\s*\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)", quote_response, re.IGNORECASE
-    )
+    _PRICE_RE = r"\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)"
+
+    # Pattern 1: "Total: $1,234.56" (structured agent output)
+    total_match = re.search(r"Total:\s*" + _PRICE_RE, quote_response, re.IGNORECASE)
     if total_match:
         try:
             return float(total_match.group(1).replace(",", ""))
         except (ValueError, IndexError):
-            return 0.0
+            pass
+
+    # Pattern 2: "= $21.50" — collect all occurrences and take the last one,
+    # which is the cumulative total in LLM-style "X + Y = Z" breakdowns.
+    eq_amounts = re.findall(r"=\s*" + _PRICE_RE, quote_response, re.IGNORECASE)
+    if eq_amounts:
+        try:
+            return float(eq_amounts[-1].replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
+    # Pattern 3: bare "total (cost|price) … $X.XX" as a last resort
+    loose_match = re.search(
+        r"total(?:\s+\w+){0,4}\s+" + _PRICE_RE, quote_response, re.IGNORECASE
+    )
+    if loose_match:
+        try:
+            return float(loose_match.group(1).replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
+    # Pattern 4: bare number without a dollar sign — e.g. "total price is 10.0"
+    # Matches "is <number>" or "total … is <number>" when no $ pattern was found.
+    # Takes the LAST match so running totals (X + Y = Z) resolve to Z.
+    _BARE_NUM = r"([\d,]+(?:\.\d+)?)"
+    bare_matches = re.findall(
+        r"(?:total|price|cost|amount)\b[^$\n]*?\bis\s+" + _BARE_NUM,
+        quote_response, re.IGNORECASE,
+    )
+    if bare_matches:
+        try:
+            return float(bare_matches[-1].replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
     return 0.0
 
 
@@ -304,6 +453,63 @@ def parse_transaction_id(sales_agent_response: str) -> str:
         except Exception:
             pass
 
-    # Regex fallback
-    match = re.search(r"transaction ID(?: of|:) (\d+)", sales_agent_response)
-    return match.group(1) if match else "N/A"
+    # Regex fallback — several patterns the sales agent commonly produces:
+    # Pattern 1: "transaction ID of X" / "transaction ID: X" / "Transaction IDs: X, Y"
+    match = re.search(r"[Tt]ransaction\s+IDs?[:\s]+(\d+)", sales_agent_response)
+    if match:
+        return match.group(1)
+
+    # Pattern 2: "ID 42" / "ID: 42" — bare ID reference
+    match = re.search(r"\bID[:\s]+(\d+)", sales_agent_response)
+    if match:
+        return match.group(1)
+
+    # Pattern 3: the tool returns a raw integer; agent may echo it as "returns 42" or just "42."
+    match = re.search(r"\breturns?\s+(\d+)", sales_agent_response, re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return "N/A"
+
+
+def llm_parse_request(request_text: str, parser_agent) -> List[Tuple[str, int]]:
+    """Fallback parser that uses an LLM agent when the regex parser returns nothing.
+
+    Only called when parse_customer_request() returns [].  The agent receives the
+    raw request, normalises spelling/descriptions, and returns a JSON string:
+        {"items": [{"item_name": "Colored paper", "quantity": 200}, ...]}
+
+    Uses _extract_nested_json (not _extract_json) because the items list creates
+    nested braces that the flat-object regex cannot match.
+
+    Args:
+        request_text: Raw customer request string.
+        parser_agent: An instantiated RequestParserAgent (or any agent whose
+                      .run() returns a string containing the items JSON).
+
+    Returns:
+        List of (item_name, quantity) tuples, or [] if the LLM also fails.
+    """
+    try:
+        response = parser_agent.run(
+            f"Extract all products and quantities from this customer request: {request_text}"
+        )
+        data = _extract_nested_json(str(response))
+        if not data:
+            return []
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            return []
+        result = []
+        for item in items:
+            try:
+                name = str(item["item_name"]).strip()
+                qty = int(item["quantity"])
+                if name and qty > 0:
+                    result.append((name, qty))
+            except (KeyError, ValueError, TypeError):
+                continue
+        return result
+    except Exception as exc:
+        print(f"[LLM PARSER] Failed: {exc}")
+        return []

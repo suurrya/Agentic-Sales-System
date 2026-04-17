@@ -10,6 +10,5 @@ __pycache__/
 reference/
 
 # Output simulation databases generated during runs
-oltp_database.csv
-olap_database.csv
+output/
 *.db

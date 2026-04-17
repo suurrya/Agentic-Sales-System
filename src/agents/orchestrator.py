@@ -1,7 +1,7 @@
 """
 orchestrator.py
 ===============
-Master orchestrator agent and supporting infrastructure for the Munder Difflin
+Master orchestrator agent and supporting infrastructure for the PaperTrail Co.
 sales pipeline.
 
 Key components:
@@ -17,6 +17,7 @@ from typing import List, Tuple
 
 from smolagents import ToolCallingAgent, tool
 
+from src.agents.prompts import ORCHESTRATOR_PROMPT
 from src.tools.fulfillment_tools import get_delivery_timeline_tool
 from src.tools.inventory_tools import find_similar_inventory_item_tool
 from src.tools.pricing_tools import get_item_unit_price
@@ -205,11 +206,8 @@ class BestOrchestrator(ToolCallingAgent):
     def __init__(self, model, tools: list):
         super().__init__(
             name="orchestrator_agent",
-            description=(
-                "You are the master orchestrator of a sales team. Process customer requests and provide final outcomes. "
-                "Always start with gather_context_tool to fetch history and inventory simultaneously in one step. "
-                "Then use quotation_tool to price the order, and sales_tool to finalize confirmed sales."
-            ),
+            description=ORCHESTRATOR_PROMPT,
             tools=tools,
             model=model,
+            max_steps=8,
         )

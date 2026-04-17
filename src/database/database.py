@@ -1,7 +1,7 @@
 """
 database.py
 ===========
-Core database layer for the Munder Difflin sales system.
+Core database layer for the PaperTrail Co. sales system.
 
 Responsibilities:
 - Defines the full product catalogue (paper_supplies)
@@ -152,12 +152,23 @@ def init_database(engine: Engine, seed: int = 137) -> Engine:
         Exception: Re-raises any database or file I/O error after printing it.
     """
     try:
-        # Create empty transactions table to enforce column schema
-        transactions_schema = pd.DataFrame({
-            "id": [], "item_name": [], "transaction_type": [],
-            "units": [], "price": [], "transaction_date": [],
-        })
-        transactions_schema.to_sql("transactions", engine, if_exists="replace", index=False)
+        # Create transactions table with proper AUTOINCREMENT primary key.
+        # Using DDL (not pandas to_sql) so SQLite treats `id` as an actual
+        # INTEGER PRIMARY KEY AUTOINCREMENT rather than a plain nullable column.
+        # This ensures last_insert_rowid() and the hallucination-detection query
+        # (`WHERE id > :max_id`) both work correctly.
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS transactions"))
+            conn.execute(text("""
+                CREATE TABLE transactions (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_name         TEXT,
+                    transaction_type  TEXT,
+                    units             REAL,
+                    price             REAL,
+                    transaction_date  TEXT
+                )
+            """))
 
         initial_date = datetime(2025, 1, 1).isoformat()
 
@@ -242,20 +253,31 @@ def create_transaction(
         if transaction_type not in {"stock_orders", "sales"}:
             raise ValueError("Transaction type must be 'stock_orders' or 'sales'")
 
-        transaction = pd.DataFrame([{
-            "item_name": item_name,
-            "transaction_type": transaction_type,
-            "units": quantity,
-            "price": price,
-            "transaction_date": date_str,
-        }])
-        transaction.to_sql("transactions", engine, if_exists="append", index=False)
+        # Use a single connection for INSERT + last_insert_rowid().
+        # If INSERT and the rowid query use different connections (as pandas
+        # to_sql + pd.read_sql would), last_insert_rowid() returns 0 because
+        # it is per-connection in SQLite — only the connection that ran the
+        # INSERT sees a non-zero value.
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(item_name, transaction_type, units, price, transaction_date) "
+                    "VALUES (:item_name, :transaction_type, :units, :price, :transaction_date)"
+                ),
+                {
+                    "item_name": item_name,
+                    "transaction_type": transaction_type,
+                    "units": quantity,
+                    "price": price,
+                    "transaction_date": date_str,
+                },
+            )
+            row_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
 
-        # Retrieve the auto-assigned row ID from SQLite
-        result = pd.read_sql("SELECT last_insert_rowid() as id", engine)
-        if result.empty:
+        if not row_id:
             raise RuntimeError("Failed to retrieve transaction ID after insert")
-        return int(result.iloc[0]["id"])
+        return int(row_id)
     except Exception as e:
         print(f"Error creating transaction: {e}")
         raise

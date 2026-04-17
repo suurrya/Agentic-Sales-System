@@ -16,6 +16,8 @@ LLM negotiation behaviour:
 import pandas as pd
 from smolagents import ToolCallingAgent
 
+from src.agents.prompts import CUSTOMER_NEGOTIATION_PROMPT
+
 
 class CustomerAgent:
     """Simulates a customer's decision-making during the sales negotiation.
@@ -50,16 +52,9 @@ class CustomerAgent:
         if model is not None:
             self._agent = ToolCallingAgent(
                 name="customer_agent",
-                description=(
-                    f"You are a customer negotiating a purchase of paper supplies. "
-                    f"Your total budget is ${self.budget:.2f}. "
-                    f"Negotiation strategy: {self.negotiation_strategy}. "
-                    "Rules: "
-                    "1. If the quoted price is within budget, respond with 'yes, I accept'. "
-                    "2. If over budget by up to 20%, counter-offer with ONE specific concession — "
-                    "e.g. request a bulk discount, reduce the quantity, or ask for a slower delivery. "
-                    "3. If over budget by more than 20%, politely decline and state your budget limit. "
-                    "Keep all responses under 2 sentences."
+                description=CUSTOMER_NEGOTIATION_PROMPT.format(
+                    budget=self.budget,
+                    strategy=self.negotiation_strategy,
                 ),
                 tools=[],
                 model=model,

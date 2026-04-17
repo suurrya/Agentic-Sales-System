@@ -9,10 +9,13 @@ python-dotenv # Loads NVIDIA_API_KEY and other secrets from .env
 sqlalchemy    # SQLite engine, parameterised queries, connection management
 
 # Agent framework
-smolagents    # HuggingFace multi-agent framework — ToolCallingAgent, @tool decorator
+smolagents[openai]  # HuggingFace multi-agent framework — ToolCallingAgent, @tool decorator, OpenAIServerModel
 
 # Structured output validation
 pydantic      # Schema validation for LLM-returned JSON at every agent boundary
 
 # Dashboard
 nicegui       # NiceGUI web dashboard — run dashboard.py to view live analytics
+
+# Resilient JSON parsing
+json-repair   # Fixes malformed LLM JSON output (single quotes, missing quotes, trailing commas)
