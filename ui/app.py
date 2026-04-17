@@ -7,8 +7,6 @@ Pages
 -----
   /            Landing page — email selection, "Begin Session" → session start
   /portal      Customer request portal — submit an order, watch it process live
-  /live        OLTP live feed — transactions auto-refresh every 5 s from the DB
-  /analytics   OLAP analytics — charts from batch CSV output + live DB aggregates
 
 Run
 ---
