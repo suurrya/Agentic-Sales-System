@@ -18,19 +18,98 @@ This app is for the manager only. Customers use ui/app.py (port 8080).
 
 import os
 import sys
+import threading
+from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pandas as pd
 from nicegui import ui
 
-from src.database.database import db_engine
+from src.database.database import db_engine, generate_financial_report, create_transaction
 
 OLAP_PATH     = "data/output/olap_database.csv"
 OLTP_PATH     = "data/output/oltp_database.csv"
 FAILURES_PATH = "data/output/agent_failures.jsonl"
 
 BRAND = "bg-teal-800"
+
+_csv_lock = threading.Lock()
+
+
+def _append_row(path: str, row: dict) -> None:
+    with _csv_lock:
+        df = pd.DataFrame([row])
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            df.to_csv(path, mode="a", header=False, index=False)
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            df.to_csv(path, index=False)
+
+
+def _do_reset() -> dict:
+    """Restock all inventory items to their initial levels without touching sales history.
+
+    For each item, computes the gap between initial stock (inventory.current_stock)
+    and effective stock (stock_orders - sales from transactions), then inserts a
+    stock_orders transaction to cover the difference. Sales history is preserved.
+    """
+    reset_date = datetime.now().strftime("%Y-%m-%d")
+
+    inventory_df = pd.read_sql(
+        "SELECT item_name, current_stock FROM inventory", db_engine
+    )
+
+    restocked_items = 0
+    total_units_added = 0
+
+    for _, item in inventory_df.iterrows():
+        current_stock_row = pd.read_sql(
+            """SELECT COALESCE(SUM(CASE
+                   WHEN transaction_type = 'stock_orders' THEN units
+                   WHEN transaction_type = 'sales'        THEN -units
+                   ELSE 0 END), 0) AS stock
+               FROM transactions
+               WHERE item_name = :name AND transaction_date <= :date""",
+            db_engine,
+            params={"name": item["item_name"], "date": reset_date},
+        )
+        current = int(current_stock_row.iloc[0]["stock"])
+        initial = int(item["current_stock"])
+        gap = initial - current
+
+        if gap > 0:
+            create_transaction(db_engine, item["item_name"], "stock_orders", gap, 0.0, reset_date)
+            restocked_items += 1
+            total_units_added += gap
+
+    ts = datetime.now().isoformat()
+    _append_row(OLTP_PATH, {
+        "transaction_id":  f"RESET_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "request_id":      "SYSTEM",
+        "timestamp":       ts,
+        "customer_type":   "SYSTEM",
+        "event":           "Stock Reset",
+        "is_fulfilled":    True,
+        "items_checked":   len(inventory_df),
+        "items_fulfilled": restocked_items,
+        "total_value":     0.0,
+    })
+
+    report = generate_financial_report(db_engine, reset_date)
+    _append_row(OLAP_PATH, {
+        "request_id":      "SYSTEM",
+        "request_date":    reset_date,
+        "cash_balance":    report["cash_balance"],
+        "inventory_value": report["inventory_value"],
+        "response":        f"Stock reset — {restocked_items} items restocked, {total_units_added:,} units added",
+    })
+
+    return {
+        "num_items":        restocked_items,
+        "total_stock":      total_units_added,
+        "report":           report,
+    }
 
 
 # ── Shared components ─────────────────────────────────────────────────────────
@@ -112,8 +191,46 @@ def dashboard_page():
     ui.page_title("PaperTrail Co. — Dashboard")
 
     with ui.column().classes("w-full px-6 py-6 gap-5"):
-        ui.label("Analytics Dashboard").classes("text-2xl font-bold text-gray-800")
-        ui.label("Financial overview from web portal orders.").classes("text-gray-500 text-sm")
+        with ui.row().classes("w-full items-center justify-between"):
+            with ui.column().classes("gap-0"):
+                ui.label("Analytics Dashboard").classes("text-2xl font-bold text-gray-800")
+                ui.label("Financial overview from web portal orders.").classes("text-gray-500 text-sm")
+
+            def open_reset_dialog():
+                with ui.dialog() as dialog, ui.card().classes("p-6 gap-4 max-w-sm"):
+                    with ui.row().classes("items-center gap-2"):
+                        ui.icon("warning").classes("text-red-500 text-2xl")
+                        ui.label("Reset Database?").classes("text-lg font-bold text-gray-800")
+                    ui.label(
+                        "This will restore all inventory items to their initial stock levels. "
+                        "Sales history will be preserved."
+                    ).classes("text-sm text-gray-600")
+                    with ui.row().classes("gap-3 justify-end w-full mt-2"):
+                        ui.button("Cancel", on_click=dialog.close).props("flat")
+
+                        def confirm_reset():
+                            dialog.close()
+                            try:
+                                summary = _do_reset()
+                                ui.notify(
+                                    f"Database reset — {summary['num_items']} items, "
+                                    f"{summary['total_stock']:,} units restocked. "
+                                    f"Cash: ${summary['report']['cash_balance']:,.2f}",
+                                    type="positive",
+                                    timeout=5000,
+                                )
+                                ui.navigate.reload()
+                            except Exception as exc:
+                                ui.notify(f"Reset failed: {exc}", type="negative")
+
+                        ui.button("Reset", on_click=confirm_reset).classes(
+                            "bg-red-600 text-white"
+                        )
+                dialog.open()
+
+            ui.button("Reset Database", icon="restart_alt", on_click=open_reset_dialog).classes(
+                "bg-red-600 text-white"
+            )
 
         try:
             olap, real = _load_olap()

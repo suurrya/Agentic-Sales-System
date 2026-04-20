@@ -357,3 +357,4 @@ if __name__ == "__main__":
     asyncio.run(run_test_scenarios(db_engine, model, limit=args.limit))
     print("\n--- Batch processing complete. Results saved to data/output/ ---")
     print("--- Run `python evaluator/evaluator.py` to evaluate the results ---")
+    print("Note: if you see any unhandled exceptions in the logs above, check the log file for partial results — some requests may have completed successfully before the error occurred.")

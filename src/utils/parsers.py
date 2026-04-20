@@ -243,6 +243,7 @@ def parse_customer_request(request: str) -> List[Tuple[str, int]]:
     )
     pattern_b = re.compile(
         r"(\d[\d,]*)\s+"
+        r"(?:of\s+)?"
         r"((?:disposable\s+)?(?:large\s+|small\s+|sticky\s+)?"
         rf"(?:[a-zA-Z][a-zA-Z0-9 \-]*?\s+)?(?:{_PRODUCT_ENDINGS}))"
         + _STOP,
@@ -355,17 +356,48 @@ def parse_price_from_quote(quote_response) -> float:
         except (ValueError, IndexError):
             pass
 
-    # Pattern 4: bare number without a dollar sign — e.g. "total price is 10.0"
-    # Matches "is <number>" or "total … is <number>" when no $ pattern was found.
-    # Takes the LAST match so running totals (X + Y = Z) resolve to Z.
     _BARE_NUM = r"([\d,]+(?:\.\d+)?)"
+
+    # Pattern 4: last bare "= NUMBER" — catches LLM math breakdowns like
+    # "48 + 1050 + 70 + 60 = 1228" where the final = is the running total.
+    eq_bare = re.findall(r"=\s*" + _BARE_NUM, quote_response)
+    if eq_bare:
+        try:
+            return float(eq_bare[-1].replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
+    # Pattern 5: "total price is: NUMBER" — handles optional colon/punctuation
+    # after "is" so "price is: 1228" and "price is 1228" both match.
     bare_matches = re.findall(
-        r"(?:total|price|cost|amount)\b[^$\n]*?\bis\s+" + _BARE_NUM,
+        r"(?:total|price|cost|amount)\b[^$\n]*?\bis[\s:]+\s*" + _BARE_NUM,
         quote_response, re.IGNORECASE,
     )
     if bare_matches:
         try:
             return float(bare_matches[-1].replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
+    # Pattern 6: "Price: 50.00" — label immediately followed by a bare number (no open paren)
+    label_match = re.search(
+        r"(?:price|cost|total|amount)\s*:\s*(?!\()" + _BARE_NUM,
+        quote_response, re.IGNORECASE,
+    )
+    if label_match:
+        try:
+            return float(label_match.group(1).replace(",", ""))
+        except (ValueError, IndexError):
+            pass
+
+    # Pattern 6: "50 dollars" / "50.00 dollars"
+    dollars_match = re.search(
+        r"\b" + _BARE_NUM + r"\s+dollars\b",
+        quote_response, re.IGNORECASE,
+    )
+    if dollars_match:
+        try:
+            return float(dollars_match.group(1).replace(",", ""))
         except (ValueError, IndexError):
             pass
 

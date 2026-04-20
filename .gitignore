@@ -16,8 +16,6 @@ node_modules
 # Python bytecode caches
 __pycache__/
 
-reference/
-
 # Output simulation databases generated during runs
 output/
 *.db

@@ -45,13 +45,14 @@ from src.utils.logger import PipelineLogger
 from src.agents.specialized import create_specialized_agents
 from src.agents.orchestrator import _with_retry
 from src.tools.inventory_tools import check_inventory_tool, find_similar_inventory_item_tool
+from src.tools.pricing_tools import get_item_unit_price
 
 # ── Shared model (one instance, shared across all requests) ───────────────────
 _model = ResilientOpenAIModel(
     model_id="meta/llama-3.3-70b-instruct",
     api_base="https://integrate.api.nvidia.com/v1",
     api_key=os.getenv("NVIDIA_API_KEY"),
-    client_kwargs={"timeout": 30},
+    client_kwargs={"timeout": 60},
 )
 
 OLAP_PATH = "data/output/olap_database.csv"
@@ -114,7 +115,7 @@ async def _check_item_stock(item_name: str, quantity: int, request_date: str) ->
     stock = await loop.run_in_executor(
         None, lambda: check_inventory_tool(item_name=resolved, as_of_date=request_date)
     )
-    return (resolved, stock) if stock >= quantity else (None, stock)
+    return resolved, stock
 
 
 async def run_web_pipeline(
@@ -122,7 +123,7 @@ async def run_web_pipeline(
     job_type: str,
     event: str,
     on_status,        # sync callable(str) — updates the UI status label
-    on_quote_ready,   # async callable(price, quote_text) -> bool — shows quote to user, returns True=accept
+    on_quote_ready,   # async callable(price, line_items) -> bool — line_items: list[(name, qty, unit_price)]
 ):
     """Run the full sales pipeline for one web-submitted order.
 
@@ -161,12 +162,10 @@ async def run_web_pipeline(
                 db_engine,
             ).iloc[0]["cash"]),
         )
-        inv_value = 0.0
-        if success:
-            report = await loop.run_in_executor(
-                None, generate_financial_report, db_engine, request_date
-            )
-            inv_value = report["inventory_value"]
+        report = await loop.run_in_executor(
+            None, generate_financial_report, db_engine, request_date
+        )
+        inv_value = report["inventory_value"]
         await loop.run_in_executor(None, _append_row, OLTP_PATH, {
             "transaction_id": f"web_{req_id}",
             "request_id":     req_id,
@@ -212,13 +211,16 @@ async def run_web_pipeline(
     _web_logger.end(req_id, "INVENTORY CHECK")
 
     for (item_name, quantity), result in zip(parsed_items, check_results):
-        resolved_name, stock_level = (None, 0) if isinstance(result, Exception) else result
-        if resolved_name is None:
-            msg = f"'{item_name}' has insufficient stock ({stock_level} available, {quantity} needed)."
+        if isinstance(result, Exception):
+            resolved_name, stock_level = item_name, 0
+        else:
+            resolved_name, stock_level = result
+        if stock_level < quantity:
+            msg = f"'{resolved_name}' has insufficient stock ({stock_level} available, {quantity} needed)."
             on_status(f"Out of stock: {msg}")
             return await _commit(
                 msg, False, "Insufficient stock",
-                f"'{item_name}' has insufficient stock ({stock_level} available, {quantity} needed)",
+                f"'{resolved_name}' has insufficient stock ({stock_level} available, {quantity} needed)",
             )
         corrected_items.append((resolved_name, quantity))
 
@@ -231,8 +233,11 @@ async def run_web_pipeline(
             None, quotation_agent,
             f"Generate a full price quote for: {quote_request_text}",
         )
-    except Exception:
-        quote_response = ""
+    except Exception as e:
+        _web_logger.end(req_id, "QUOTE")
+        msg = f"Quote generation failed — agent error: {e}"
+        on_status(msg)
+        return await _commit(msg, False, "Quote failure", str(e))
     _web_logger.end(req_id, "QUOTE")
 
     quoted_price = parse_price_from_quote(quote_response)
@@ -244,9 +249,12 @@ async def run_web_pipeline(
     # ── Phase 4: Customer approval (real user decision via UI) ────────────────
     # Pipeline pauses here — on_quote_ready shows the quote card and waits for
     # the user to click Accept or Decline before returning True/False.
-    items_summary = ", ".join(f"{qty}× {name}" for name, qty in corrected_items)
+    unit_prices = await asyncio.gather(
+        *[loop.run_in_executor(None, get_item_unit_price, name) for name, _ in corrected_items]
+    )
+    line_items = [(name, qty, upr) for (name, qty), upr in zip(corrected_items, unit_prices)]
     on_status(f"Quote ready: ${quoted_price:.2f} — awaiting your decision...")
-    accepted = await on_quote_ready(quoted_price, items_summary)
+    accepted = await on_quote_ready(quoted_price, line_items)
 
     if not accepted:
         msg = f"Order declined. You chose not to proceed at ${quoted_price:.2f}."
@@ -460,9 +468,13 @@ def order_page():
         # ── Quote approval card (hidden until quote is ready) ────────────────
         quote_card = ui.card().classes("w-full shadow hidden border-2 border-blue-300 bg-blue-50")
         with quote_card:
-            ui.label("Price Quote Ready").classes("text-base font-semibold text-blue-800 mb-1")
-            quote_detail = ui.label("").classes("text-sm text-gray-600 mb-3")
-            quote_price  = ui.label("").classes("text-3xl font-bold text-blue-700 mb-4")
+            ui.label("Price Quote Ready").classes("text-base font-semibold text-blue-800 mb-2")
+            quote_lines_container = ui.column().classes("w-full gap-0 mb-1")
+            ui.separator().classes("my-1")
+            with ui.row().classes("w-full justify-between px-1"):
+                ui.label("Total").classes("text-sm font-bold text-gray-800")
+                quote_price = ui.label("").classes("text-sm font-bold text-blue-700")
+            ui.separator().classes("my-2")
             ui.label("Do you agree to this price?").classes("text-sm text-gray-700 font-medium")
             with ui.row().classes("gap-3 mt-2"):
                 accept_btn  = ui.button("Accept Quote", icon="check_circle").classes(
@@ -512,9 +524,14 @@ def order_page():
             _decision_event = asyncio.Event()
             _user_accepted  = [False]
 
-            async def on_quote_ready(price: float, items_summary: str) -> bool:
+            async def on_quote_ready(price: float, line_items: list) -> bool:
                 """Show the quote card and suspend until the user clicks Accept or Decline."""
-                quote_detail.set_text(items_summary)
+                quote_lines_container.clear()
+                with quote_lines_container:
+                    for name, qty, unit_price in line_items:
+                        with ui.row().classes("w-full justify-between px-1 py-0.5"):
+                            ui.label(f"{qty}× {name}").classes("text-sm text-gray-700")
+                            ui.label(f"${qty * unit_price:,.2f}").classes("text-sm text-gray-700")
                 quote_price.set_text(f"${price:,.2f}")
                 quote_card.classes(remove="hidden")
                 progress_timer.cancel()           # pause the bar while user decides
